@@ -1,5 +1,5 @@
 // src/App.tsx
-import React, { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 
 // ================================================
@@ -177,8 +177,8 @@ export default function App() {
     return () => cancelAnimationFrame(raf);
   }, [animate, dir, speed]);
 
-  // Padrão atual
-  const { thetas, fieldRaw, powerRaw, fieldNorm, powerNorm } = useMemo(
+  // Padrão atual (REMOVIDO fieldRaw, não era usado)
+  const { thetas, powerRaw, fieldNorm, powerNorm } = useMemo(
     () => computePattern(N, dOverLambda, elem),
     [N, dOverLambda, elem]
   );
