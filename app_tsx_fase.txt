@@ -1,0 +1,550 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { motion } from "framer-motion";
+
+// ==============================================================
+// Colinear de Dipolos λ/2 — Visualização Pro
+// --------------------------------------------------------------
+// • N = 1..10 (empilhamento vertical)
+// • Elemento: Dipolo fino λ/2 (fator de elemento realista)
+// • Fase progressiva α (rad) geral OU alvo de apontamento θ₀ (tilt elétrico)
+// • Gráficos: Polar (campo), Planar (Potência dB × θ), Ganho(dB[unit]) × d/λ,
+//   Trilha de fases por elemento (ϕₙ = n·α) com cromática de fase
+// • HUD compacto no topo do gráfico planar (sem sobrepor a curva útil)
+// • Switch dBi ↔ dBd, Modal com explicações e matemática
+// ==============================================================
+
+// ---------- Utilidades ----------
+const deg2rad = (deg: number) => (Math.PI / 180) * deg;
+const rad2deg = (rad: number) => (180 / Math.PI) * rad;
+const clamp = (x: number, a: number, b: number) => Math.max(a, Math.min(b, x));
+const toDb = (x: number) => 10 * Math.log10(Math.max(x, 1e-20));
+const DBI_TO_DBD = 2.15; // 2.15 dB: dBi → dBd
+const wrapPi = (x: number) => {
+  let y = x; const twoPi = 2 * Math.PI;
+  while (y > Math.PI) y -= twoPi;
+  while (y < -Math.PI) y += twoPi;
+  return y;
+};
+
+// ---------- Fator de elemento: Dipolo fino λ/2 vertical ----------
+// |E(θ)| ∝ |cos((π/2) cosθ) / sinθ| ; nulos em 0°/180°.
+function elemDipoleHalfWave(thetaRad: number): number {
+  const s = Math.max(Math.abs(Math.sin(thetaRad)), 1e-9);
+  const c = Math.cos(thetaRad);
+  return Math.abs(Math.cos((Math.PI / 2) * c) / s);
+}
+
+// ---------- Array Factor (geral) ----------
+// AF = sin(N ψ / 2) / sin(ψ / 2), com ψ = 2π (d/λ) cosθ + α
+function arrayFactorMag(N: number, dOverLambda: number, thetaRad: number, alphaRad: number): number {
+  if (N <= 1) return 1; // AF de um elemento é 1
+  const psi = 2 * Math.PI * dOverLambda * Math.cos(thetaRad) + alphaRad;
+  const half = psi / 2;
+  const den = Math.sin(half);
+  if (Math.abs(den) < 1e-12) return N; // limite → N
+  return Math.abs(Math.sin(N * half) / den);
+}
+
+// ---------- Padrão total (campo/potência) ----------
+function computePattern(
+  N: number,
+  dOverLambda: number,
+  alphaRad: number,
+  samples = 1441 // 0.125° para maior precisão
+) {
+  const thetas: number[] = [];
+  const fieldRaw: number[] = [];
+  const powerRaw: number[] = [];
+
+  for (let i = 0; i < samples; i++) {
+    const thDeg = (180 * i) / (samples - 1);
+    const th = deg2rad(thDeg);
+    const Af = arrayFactorMag(N, dOverLambda, th, alphaRad);
+    const Ef = elemDipoleHalfWave(th);
+    const F = Af * Ef; // campo não normalizado
+    thetas.push(thDeg);
+    fieldRaw.push(F);
+    powerRaw.push(F * F);
+  }
+  const maxField = Math.max(...fieldRaw) || 1;
+  const fieldNorm = fieldRaw.map((v) => v / maxField);
+  const powerNorm = fieldNorm.map((v) => v * v);
+  return { thetas, fieldRaw, powerRaw, fieldNorm, powerNorm };
+}
+
+// ---------- HPBW (−3 dB) ----------
+function measureHPBW(thetas: number[], powerNorm: number[]) {
+  const target = 0.5; // −3 dB
+  // índice do pico (global)
+  let idxMax = 0;
+  for (let i = 1; i < powerNorm.length; i++) if (powerNorm[i] > powerNorm[idxMax]) idxMax = i;
+  const interp = (x1: number, y1: number, x2: number, y2: number, y: number) =>
+    Math.abs(y2 - y1) < 1e-12 ? x1 : x1 + ((y - y1) * (x2 - x1)) / (y2 - y1);
+
+  // esquerda do pico
+  let i = idxMax;
+  while (i > 0 && powerNorm[i] > target) i--;
+  const L = (i > 0)
+    ? interp(thetas[i], powerNorm[i], thetas[i + 1], powerNorm[i + 1], target)
+    : null;
+  // direita do pico
+  i = idxMax;
+  while (i < thetas.length - 1 && powerNorm[i] > target) i++;
+  const R = (i < thetas.length - 1)
+    ? interp(thetas[i - 1], powerNorm[i - 1], thetas[i], powerNorm[i], target)
+    : null;
+
+  return { left: L, right: R, width: L !== null && R !== null ? R - L : null, peakTheta: thetas[idxMax] };
+}
+
+// ---------- Nulos e 1º Sidelobe ----------
+function findFirstNullAndSLL(thetas: number[], powerNorm: number[], aroundDeg = 90) {
+  let idx0 = 0, best = Infinity;
+  for (let i = 0; i < thetas.length; i++) {
+    const d = Math.abs(thetas[i] - aroundDeg);
+    if (d < best) { best = d; idx0 = i; }
+  }
+  const isLocalMin = (k: number) => powerNorm[k] < powerNorm[k - 1] && powerNorm[k] < powerNorm[k + 1];
+  const isLocalMax = (k: number) => powerNorm[k] > powerNorm[k - 1] && powerNorm[k] > powerNorm[k + 1];
+
+  let nL: number | null = null; for (let k = idx0 - 1; k > 1; k--) { if (isLocalMin(k)) { nL = k; break; } }
+  let nR: number | null = null; for (let k = idx0 + 1; k < thetas.length - 2; k++) { if (isLocalMin(k)) { nR = k; break; } }
+
+  let sL: number | null = null; if (nL) { for (let k = nL - 1; k > 1; k--) { if (isLocalMax(k)) { sL = k; break; } } }
+  let sR: number | null = null; if (nR) { for (let k = nR + 1; k < thetas.length - 2; k++) { if (isLocalMax(k)) { sR = k; break; } } }
+
+  const sllL = sL ? toDb(powerNorm[sL]) : null;
+  const sllR = sR ? toDb(powerNorm[sR]) : null;
+
+  return {
+    nullLeft: nL !== null ? thetas[nL] : null,
+    nullRight: nR !== null ? thetas[nR] : null,
+    sllLeft: sllL,
+    sllRight: sllR,
+    nnbw: nL !== null && nR !== null ? thetas[nR] - thetas[nL] : null,
+  };
+}
+
+// ---------- Diretividade (ganho relativo) ----------
+// D = 2 * Pmax / ∫ P(θ) sinθ dθ (padrão vertical meia-esfera)
+function computeDirectivity(powerRaw: number[], thetasDeg: number[]) {
+  let Pmax = 0; for (const p of powerRaw) Pmax = Math.max(Pmax, p);
+  let integral = 0;
+  for (let i = 0; i < powerRaw.length - 1; i++) {
+    const th1 = deg2rad(thetasDeg[i]);
+    const th2 = deg2rad(thetasDeg[i + 1]);
+    const p1 = powerRaw[i] * Math.sin(th1);
+    const p2 = powerRaw[i + 1] * Math.sin(th2);
+    integral += 0.5 * (p1 + p2) * (th2 - th1);
+  }
+  const Dlin = (2 * Pmax) / Math.max(integral, 1e-20);
+  const DdBi = 10 * Math.log10(Dlin);
+  return { Dlin, DdBi };
+}
+
+// ---------- Grating lobes (máximos do AF) para α geral ----------
+// Máximos quando ψ = 2π m ⇒ cosθ = (m - α/2π) / (d/λ)
+function gratingAnglesGeneral(dOverLambda: number, alphaRad: number) {
+  const out: number[] = [];
+  for (let m = -2; m <= 2; m++) {
+    const cosTh = (m - alphaRad / (2 * Math.PI)) / dOverLambda;
+    if (Math.abs(cosTh) <= 1) {
+      const th = rad2deg(Math.acos(clamp(cosTh, -1, 1)));
+      out.push(th, 180 - th);
+    }
+  }
+  // normaliza/ordena/remover duplicados
+  const uniq = Array.from(new Set(out.map((v) => +v.toFixed(2)))).sort((a, b) => a - b);
+  return uniq;
+}
+
+// ---------- Varredura (ganho × d/λ) ----------
+function sweepDirectivity(N: number, dMin = 0.4, dMax = 1.6, step = 0.01, alphaRad = 0) {
+  const xs: number[] = []; const ys: number[] = [];
+  for (let d = dMin; d <= dMax + 1e-9; d += step) {
+    const { thetas, powerRaw } = computePattern(N, d, alphaRad, 961);
+    const { DdBi } = computeDirectivity(powerRaw, thetas);
+    xs.push(+d.toFixed(3)); ys.push(DdBi);
+  }
+  return { x: xs, DdBi: ys };
+}
+
+export default function App() {
+  const [N, setN] = useState(6); // 1..10
+  const [dOverLambda, setD] = useState(0.85);
+  const [animate, setAnimate] = useState(true);
+  const [speed, setSpeed] = useState(0.25); // λ/s
+  const [dir, setDir] = useState(1);
+  const [gainUnit, setGainUnit] = useState<'dBi' | 'dBd'>('dBi');
+  const [showModal, setShowModal] = useState(false);
+
+  // Controle de fase/tilt
+  const [modeTilt, setModeTilt] = useState(true); // true: define por θ0; false: α manual
+  const [theta0, setTheta0] = useState(90); // 60..120° (90° = horizonte)
+  const [alphaDegManual, setAlphaDegManual] = useState(0); // −360..360°
+  const alphaRad = useMemo(() => {
+    if (modeTilt) {
+      // α = −2π (d/λ) cos θ0  (aponta o máximo para θ0)
+      return -2 * Math.PI * dOverLambda * Math.cos(deg2rad(theta0));
+    } else {
+      return deg2rad(alphaDegManual);
+    }
+  }, [modeTilt, theta0, alphaDegManual, dOverLambda]);
+  const alphaDeg = rad2deg(alphaRad);
+
+  // Varredura automática de d/λ
+  useEffect(() => {
+    let raf = 0; let last = performance.now();
+    const step = (now: number) => {
+      const dt = (now - last) / 1000; last = now;
+      if (animate) {
+        setD((prev) => {
+          let v = prev + dir * speed * dt;
+          if (v > 1.6) { v = 1.6; setDir(-1); }
+          if (v < 0.4) { v = 0.4; setDir(1); }
+          return v;
+        });
+      }
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [animate, dir, speed]);
+
+  // Padrão atual
+  const { thetas, fieldRaw, powerRaw, fieldNorm, powerNorm } = useMemo(
+    () => computePattern(N, dOverLambda, alphaRad),
+    [N, dOverLambda, alphaRad]
+  );
+
+  const hpbw = useMemo(() => measureHPBW(thetas, powerNorm), [thetas, powerNorm]);
+  const { nullLeft, nullRight, sllLeft, sllRight, nnbw } = useMemo(
+    () => findFirstNullAndSLL(thetas, powerNorm, hpbw.peakTheta ?? 90),
+    [thetas, powerNorm, hpbw.peakTheta]
+  );
+  const { DdBi } = useMemo(() => computeDirectivity(powerRaw, thetas), [powerRaw, thetas]);
+  const Ddisplay = gainUnit === 'dBi' ? DdBi : DdBi - DBI_TO_DBD;
+
+  const sweep = useMemo(() => sweepDirectivity(N, 0.4, 1.6, 0.01, alphaRad), [N, alphaRad]);
+  const sweepY = useMemo(() => sweep.DdBi.map(v => gainUnit === 'dBi' ? v : v - DBI_TO_DBD), [sweep, gainUnit]);
+
+  // ---------- Layout ----------
+  const W = 1280, H = 760;
+  const cx = 340, cy = 360; // centro da polar (subimos um pouco)
+  const R = 270; // raio da polar
+
+  // Path polar (campo)
+  const pathPolar = useMemo(() => {
+    let d = "";
+    for (let i = 0; i < thetas.length; i++) {
+      const th = thetas[i];
+      const amp = fieldNorm[i];
+      const phi = deg2rad(90 - th); // 90° → horizonte à direita
+      const r = amp * R; const x = cx + r * Math.cos(phi); const y = cy - r * Math.sin(phi);
+      d += `${i === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)} `;
+    }
+    return d;
+  }, [thetas, fieldNorm]);
+
+  // Planar dB × θ (HUD no padding superior)
+  const plan = useMemo(() => {
+    const x0 = 720, y0 = 60, w = 520, h = 320; // h maior p/ folga
+    const padL = 64, padB = 36, padT = 44, padR = 16; // padT grande para HUD
+    const xmin = 0, xmax = 180;
+    const ymin = -50, ymax = 0;
+    const X = (th: number) => x0 + padL + ((th - xmin) / (xmax - xmin)) * (w - padL - padR);
+    const Y = (db: number) => y0 + padT + (1 - (db - ymin) / (ymax - ymin)) * (h - padT - padB);
+
+    let path = "";
+    for (let i = 0; i < thetas.length; i++) {
+      const th = thetas[i]; const db = toDb(powerNorm[i]);
+      path += `${i === 0 ? "M" : "L"} ${X(th).toFixed(1)} ${Y(db).toFixed(1)} `;
+    }
+
+    // faixa HPBW
+    let shade: { xL: number; xR: number; yT: number; yB: number } | null = null;
+    if (hpbw.left !== null && hpbw.right !== null) shade = { xL: X(hpbw.left), xR: X(hpbw.right), yT: Y(0), yB: Y(-50) };
+
+    return { x0, y0, w, h, padL, padB, padT, padR, X, Y, path, shade, ymin, ymax };
+  }, [thetas, powerNorm, hpbw]);
+
+  // Posição do pico no planar
+  const peakTheta = hpbw.peakTheta ?? 90;
+
+  // Ganho × d/λ (eixo com unidade dinâmica)
+  const gainChart = useMemo(() => {
+    const x0 = 720, y0 = 410, w = 520, h = 230;
+    const padL = 64, padB = 34, padT = 14, padR = 16;
+    const xmin = 0.4, xmax = 1.6;
+    const ymin = Math.floor(Math.min(...sweepY) - 1);
+    const ymax = Math.ceil(Math.max(...sweepY) + 1);
+    const X = (x: number) => x0 + padL + ((x - xmin) / (xmax - xmin)) * (w - padL - padR);
+    const Y = (y: number) => y0 + padT + (1 - (y - ymin) / (ymax - ymin)) * (h - padT - padB);
+
+    let path = ""; for (let i = 0; i < sweep.x.length; i++) path += `${i === 0 ? "M" : "L"} ${X(sweep.x[i]).toFixed(1)} ${Y(sweepY[i]).toFixed(1)} `;
+    const cxm = X(dOverLambda), cym = Y(gainUnit === 'dBi' ? DdBi : DdBi - DBI_TO_DBD);
+    return { x0, y0, w, h, padL, padB, padT, padR, X, Y, path, cxm, cym, ymin, ymax };
+  }, [sweep, sweepY, dOverLambda, DdBi, gainUnit]);
+
+  // Esquemático do empilhamento (lado esquerdo)
+  const geometry = useMemo(() => {
+    const x0 = 60, yTop = 170, areaH = 380;
+    const mastX = x0 + 80; const n = Math.max(1, N); const steps = Math.max(1, n - 1);
+    const spacingBase = 60 * dOverLambda; const spacingFit = steps > 0 ? Math.min(spacingBase, areaH / steps) : 0;
+    const spacing = spacingFit; const bars: { x1: number; x2: number; y: number }[] = [];
+    for (let i = 0; i < n; i++) { const y = yTop + i * spacing; bars.push({ x1: mastX - 40, x2: mastX + 40, y }); }
+    let arrow: null | { x: number; y1: number; y2: number } = null; if (n > 1) arrow = { x: mastX + 55, y1: yTop, y2: yTop + spacing };
+    const totalH = (n - 1) * spacing; return { x0, yTop, mastX, spacing, bars, arrow, totalH };
+  }, [N, dOverLambda]);
+
+  // Grating lobes previstos (geral) + nível real E·AF
+  const glInfo = useMemo(() => {
+    const angs = gratingAnglesGeneral(dOverLambda, alphaRad);
+    return angs.map((ang) => {
+      // achar índice mais próximo
+      let idx = 0; let best = 1e9;
+      for (let i = 0; i < thetas.length; i++) { const d = Math.abs(thetas[i] - ang); if (d < best) { best = d; idx = i; } }
+      const levelDb = toDb(powerNorm[idx]);
+      return { ang, levelDb };
+    });
+  }, [dOverLambda, alphaRad, thetas, powerNorm]);
+
+  // Fases por elemento (ϕₙ = n·α)
+  const phases = useMemo(() => Array.from({ length: N }, (_, n) => wrapPi(n * alphaRad)), [N, alphaRad]);
+
+  // --------- UI ---------
+  const unitLabel = gainUnit === 'dBi' ? 'dBi' : 'dBd';
+
+  return (
+    <div className="min-h-screen w-full bg-neutral-950 text-neutral-100">
+      <div className="max-w-7xl mx-auto px-4 py-6">
+        <header className="mb-4 flex items-center gap-3 flex-wrap">
+          <h1 className="text-2xl md:text-3xl font-semibold">Colinear de Dipolos λ/2 — Fator de Agrupamento × Espaçamento (d/λ)</h1>
+          <div className="ml-auto flex items-center gap-2 text-sm">
+            <span className="text-neutral-400">Ganho:</span>
+            <label className={`px-2 py-1 rounded-md border ${gainUnit==='dBi'? 'bg-neutral-800 border-neutral-700':'border-neutral-700'}`}>
+              <input type="radio" name="u" className="mr-1" checked={gainUnit==='dBi'} onChange={()=>setGainUnit('dBi')} /> dBi
+            </label>
+            <label className={`px-2 py-1 rounded-md border ${gainUnit==='dBd'? 'bg-neutral-800 border-neutral-700':'border-neutral-700'}`}>
+              <input type="radio" name="u" className="mr-1" checked={gainUnit==='dBd'} onChange={()=>setGainUnit('dBd')} /> dBd
+            </label>
+            <button onClick={()=>alert('Use o botão “Explicações” ao final para abrir o modal.')} className="hidden" />
+          </div>
+        </header>
+
+        {/* BLOCO PRINCIPAL */}
+        <div className="rounded-2xl bg-neutral-900 p-4 shadow-lg overflow-hidden">
+          <svg width={W} height={H}>
+            {/* --- Títulos dos gráficos --- */}
+            <text x={40} y={30} fill="#9ca3af" fontSize={14}>Polar (campo normalizado)</text>
+            <text x={720} y={30} fill="#9ca3af" fontSize={14}>Potência (dB) vs θ</text>
+            <text x={720} y={392} fill="#9ca3af" fontSize={14}>Ganho relativo (diretividade, dB{unitLabel}) vs d/λ</text>
+
+            {/* --- Grade polar --- */}
+            {[0.2,0.4,0.6,0.8,1.0].map((r,i)=> (
+              <circle key={i} cx={cx} cy={cy} r={r*R} fill="none" stroke="#262626" />
+            ))}
+            {Array.from({length: 12}).map((_,i)=>{
+              const ang = deg2rad(i*15); const x = cx + R*Math.cos(ang); const y = cy - R*Math.sin(ang);
+              return <line key={i} x1={cx} y1={cy} x2={x} y2={y} stroke="#262626" />;
+            })}
+            {/* Rótulos */}
+            <text x={cx} y={cy-R-8} textAnchor="middle" fill="#9ca3af" fontSize={12}>0° (zênite)</text>
+            <text x={cx+R+10} y={cy+4} fill="#9ca3af" fontSize={12}>90° (horizonte)</text>
+            <text x={cx} y={cy+R+16} textAnchor="middle" fill="#9ca3af" fontSize={12}>180° (nadir)</text>
+
+            {/* Padrão polar */}
+            <motion.path d={pathPolar} fill="none" stroke="#22d3ee" strokeWidth={2.8} initial={false} animate={{ d: pathPolar }} transition={{ duration: 0.35 }}/>
+
+            {/* GL previstos (AF geral) + nível real E·AF */}
+            {glInfo.map(({ ang, levelDb }, idx) => {
+              const phi = deg2rad(90 - ang); const x = cx + R*Math.cos(phi); const y = cy - R*Math.sin(phi);
+              return (
+                <g key={`gl-${idx}`}>
+                  <line x1={cx} y1={cy} x2={x} y2={y} stroke="#ef4444" strokeDasharray="5 4" />
+                  <text x={x} y={y} fill="#ef4444" fontSize={12} dx={4} dy={-4}>{`${ang.toFixed(1)}° / ${levelDb.toFixed(1)} dB`}</text>
+                </g>
+              );
+            })}
+
+            {/* --- Planar dB × θ --- */}
+            <rect x={plan.x0} y={plan.y0} width={plan.w} height={plan.h} fill="#0b0b0b" stroke="#1f2937" rx={12}/>
+            {/* HUD compacto no topo do planar (dentro do padding) */}
+            <text x={plan.x0+plan.padL} y={plan.y0+22} fill="#e5e7eb" fontSize={12}>
+              {`N=${N}  d/λ=${dOverLambda.toFixed(3)}  Ganho≈${Ddisplay.toFixed(2)} dB${unitLabel}  HPBW=${hpbw.width? hpbw.width.toFixed(1):'—'}°  NNBW=${nnbw? nnbw.toFixed(1):'—'}°  `}
+            </text>
+            <text x={plan.x0+plan.padL} y={plan.y0+38} fill="#9ca3af" fontSize={11}>
+              {modeTilt ? `θ₀=${theta0.toFixed(1)}°  →  α=${alphaDeg.toFixed(1)}°` : `α=${alphaDegManual.toFixed(1)}° (manual)`}
+            </text>
+
+            {[-50,-40,-30,-20,-10,0].map((v,i)=> (
+              <g key={i}>
+                <line x1={plan.x0+plan.padL} y1={plan.Y(v)} x2={plan.x0+plan.w-plan.padR} y2={plan.Y(v)} stroke="#1f2937" />
+                <text x={plan.x0+12} y={plan.Y(v)+4} fontSize={11} fill="#9ca3af">{v} dB</text>
+              </g>
+            ))}
+            {[0,30,60,90,120,150,180].map((t,i)=> (
+              <g key={i}>
+                <line x1={plan.X(t)} y1={plan.y0+plan.h-plan.padB} x2={plan.X(t)} y2={plan.y0+plan.h-plan.padB+4} stroke="#374151" />
+                <text x={plan.X(t)} y={plan.y0+plan.h-8} fontSize={11} fill="#9ca3af" textAnchor="middle">{t}°</text>
+              </g>
+            ))}
+            {plan.shade && (
+              <rect x={plan.shade.xL} y={plan.shade.yT} width={plan.shade.xR-plan.shade.xL} height={plan.shade.yB-plan.shade.yT} fill="#10b98122" />
+            )}
+            {/* Cursor do pico */}
+            <line x1={plan.X(peakTheta)} y1={plan.y0+plan.padT} x2={plan.X(peakTheta)} y2={plan.y0+plan.h-plan.padB} stroke="#f59e0b" strokeDasharray="6 4"/>
+            {/* -3 dB */}
+            <line x1={plan.x0+plan.padL} y1={plan.Y(-3)} x2={plan.x0+plan.w-plan.padR} y2={plan.Y(-3)} stroke="#10b981" strokeDasharray="6 4" />
+            {/* curva */}
+            <motion.path d={plan.path} fill="none" stroke="#a78bfa" strokeWidth={2.3} initial={false} animate={{ d: plan.path }} transition={{ duration: 0.35 }} />
+
+            {/* --- Trilha de fases por elemento (ϕₙ = n·α) --- */}
+            <g>
+              <text x={720} y={360} fill="#9ca3af" fontSize={12}>Trilha de fases — ϕₙ = n·α</text>
+              {/* linha base */}
+              <line x1={plan.x0+plan.padL} y1={370} x2={plan.x0+plan.w-plan.padR} y2={370} stroke="#334155" />
+              {phases.map((ph, n) => {
+                const t = n / Math.max(1, N - 1);
+                const x = plan.x0 + plan.padL + t * (plan.w - plan.padL - plan.padR);
+                const hue = ((ph + Math.PI) / (2 * Math.PI)) * 360; // −π..π → 0..360
+                return (
+                  <g key={n}>
+                    <circle cx={x} cy={370} r={10} fill={`hsl(${hue} 80% 55%)`} stroke="#0b0b0b" />
+                    <text x={x} y={392} fontSize={10} fill="#d1d5db" textAnchor="middle">{rad2deg(ph).toFixed(0)}°</text>
+                  </g>
+                );
+              })}
+              <text x={plan.x0+plan.w-110} y={350} fontSize={11} fill="#9ca3af">α = {alphaDeg.toFixed(1)}°</text>
+              {modeTilt && (
+                <text x={plan.x0+plan.w-200} y={350} fontSize={11} fill="#9ca3af">θ₀ = {theta0.toFixed(1)}°</text>
+              )}
+            </g>
+
+            {/* --- Ganho × d/λ --- */}
+            <rect x={gainChart.x0} y={gainChart.y0} width={gainChart.w} height={gainChart.h} fill="#0b0b0b" stroke="#1f2937" rx={12}/>
+            {Array.from({length: 6}).map((_,i)=>{
+              const yv = gainChart.ymin + (i*(gainChart.ymax-gainChart.ymin))/5;
+              return (
+                <g key={i}>
+                  <line x1={gainChart.x0+gainChart.padL} y1={gainChart.Y(yv)} x2={gainChart.x0+gainChart.w-gainChart.padR} y2={gainChart.Y(yv)} stroke="#1f2937" />
+                  <text x={gainChart.x0+12} y={gainChart.Y(yv)+4} fontSize={11} fill="#9ca3af">{yv.toFixed(0)} dB{unitLabel}</text>
+                </g>
+              );
+            })}
+            {[0.4,0.6,0.8,1.0,1.2,1.4,1.6].map((v,i)=> (
+              <g key={i}>
+                <line x1={gainChart.X(v)} y1={gainChart.y0+gainChart.h-gainChart.padB} x2={gainChart.X(v)} y2={gainChart.y0+gainChart.h-gainChart.padB+4} stroke="#374151" />
+                <text x={gainChart.X(v)} y={gainChart.y0+gainChart.h-8} fontSize={11} fill="#9ca3af" textAnchor="middle">{v.toFixed(1)}</text>
+              </g>
+            ))}
+            <motion.path d={gainChart.path} fill="none" stroke="#38bdf8" strokeWidth={2.3} initial={false} animate={{ d: gainChart.path }} transition={{ duration: 0.35 }} />
+            <circle cx={gainChart.cxm} cy={gainChart.cym} r={4.5} fill="#38bdf8" />
+
+            {/* --- Esquemático do empilhamento (coluna esquerda) --- */}
+            <text x={40} y={120} fill="#9ca3af" fontSize={13}>Esquemático do empilhamento</text>
+            <line x1={geometry.mastX} y1={geometry.yTop-10} x2={geometry.mastX} y2={geometry.yTop+geometry.totalH+10} stroke="#374151" strokeWidth={3} />
+            {geometry.bars.map((b, i) => (
+              <line key={i} x1={b.x1} x2={b.x2} y1={b.y} y2={b.y} stroke="#e5e7eb" strokeWidth={3} />
+            ))}
+            {geometry.arrow && (
+              <g>
+                <line x1={geometry.arrow.x} y1={geometry.arrow.y1} x2={geometry.arrow.x} y2={geometry.arrow.y2} stroke="#22d3ee" />
+                <polygon points={`${geometry.arrow.x-4},${geometry.arrow.y1+10} ${geometry.arrow.x+4},${geometry.arrow.y1+10} ${geometry.arrow.x},${geometry.arrow.y1}`} fill="#22d3ee" />
+                <polygon points={`${geometry.arrow.x-4},${geometry.arrow.y2-10} ${geometry.arrow.x+4},${geometry.arrow.y2-10} ${geometry.arrow.x},${geometry.arrow.y2}`} fill="#22d3ee" />
+                <text x={geometry.arrow.x+8} y={(geometry.arrow.y1+geometry.arrow.y2)/2} fill="#22d3ee" fontSize={12} dominantBaseline="middle">d = {dOverLambda.toFixed(3)}·λ</text>
+              </g>
+            )}
+          </svg>
+
+          {/* CONTROLES */}
+          <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4 mt-3">
+            {/* Grupo 1: N e d/λ */}
+            <div className="rounded-2xl bg-neutral-900/60 border border-neutral-800 p-4">
+              <div className="flex items-center justify-between mb-2"><div className="font-medium">Nº de elementos (N)</div><div className="text-neutral-300">{N}</div></div>
+              <input type="range" min={1} max={10} step={1} value={N} onChange={(e)=>setN(parseInt(e.target.value))} className="w-full"/>
+              <div className="flex items-center justify-between mt-4 mb-2"><div className="font-medium">Espaçamento d/λ</div><div className="text-neutral-300">{dOverLambda.toFixed(3)} λ</div></div>
+              <input type="range" min={0.4} max={1.6} step={0.001} value={dOverLambda} onChange={(e)=>setD(parseFloat(e.target.value))} className="w-full"/>
+              <div className="flex items-center gap-3 mt-4">
+                <button onClick={()=>setAnimate(v=>!v)} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 transition">{animate?"Pausar animação":"Reproduzir animação"}</button>
+                <div className="ml-auto text-sm text-neutral-300">Velocidade</div>
+                <input type="range" min={0.05} max={0.8} step={0.01} value={speed} onChange={(e)=>setSpeed(parseFloat(e.target.value))}/>
+              </div>
+            </div>
+
+            {/* Grupo 2: Tilt/Fase */}
+            <div className="rounded-2xl bg-neutral-900/60 border border-neutral-800 p-4">
+              <div className="flex items-center gap-3 text-sm mb-2">
+                <span className="font-medium">Fase de alimentação</span>
+                <label className="ml-auto flex items-center gap-1"><input type="radio" name="m" checked={modeTilt} onChange={()=>setModeTilt(true)} /> θ₀ (tilt)</label>
+                <label className="flex items-center gap-1"><input type="radio" name="m" checked={!modeTilt} onChange={()=>setModeTilt(false)} /> α (manual)</label>
+              </div>
+              {modeTilt ? (
+                <>
+                  <div className="flex items-center justify-between mb-2"><div>Apontamento θ₀</div><div className="text-neutral-300">{theta0.toFixed(1)}°</div></div>
+                  <input type="range" min={60} max={120} step={0.1} value={theta0} onChange={(e)=>setTheta0(parseFloat(e.target.value))} className="w-full"/>
+                  <div className="text-xs text-neutral-400 mt-2">α calculado: {alphaDeg.toFixed(2)}°</div>
+                </>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between mb-2"><div>Δfase (α)</div><div className="text-neutral-300">{alphaDegManual.toFixed(1)}°</div></div>
+                  <input type="range" min={-360} max={360} step={0.1} value={alphaDegManual} onChange={(e)=>setAlphaDegManual(parseFloat(e.target.value))} className="w-full"/>
+                  <div className="text-xs text-neutral-400 mt-2">θ₀ aproximado: {(() => {
+                    const cosTh = (-alphaRad/(2*Math.PI)) / dOverLambda; return Math.abs(cosTh) <= 1 ? rad2deg(Math.acos(cosTh)).toFixed(1) : '—';
+                  })()}°</div>
+                </>
+              )}
+            </div>
+
+            {/* Grupo 3: Métricas resumidas */}
+            <div className="rounded-2xl bg-neutral-900/60 border border-neutral-800 p-4 grid grid-cols-2 gap-3 text-sm">
+              <div className="bg-neutral-800/50 rounded-xl p-3"><div className="text-neutral-400">HPBW / NNBW</div><div className="text-xl font-semibold">{hpbw.width ? `${hpbw.width.toFixed(1)}°` : "—"} / {nnbw? `${nnbw.toFixed(1)}°`:'—'}</div></div>
+              <div className="bg-neutral-800/50 rounded-xl p-3"><div className="text-neutral-400">Ganho</div><div className="text-xl font-semibold">{Ddisplay.toFixed(2)} dB{unitLabel}</div></div>
+              <div className="bg-neutral-800/50 rounded-xl p-3"><div className="text-neutral-400">1º SL</div><div className="text-xl font-semibold">{sllLeft!==null||sllRight!==null ? `${(Math.max(sllLeft??-99,sllRight??-99)).toFixed(1)} dB` : "—"}</div></div>
+              <div className="bg-neutral-800/50 rounded-xl p-3"><div className="text-neutral-400">GL (prev.)</div><div className="text-sm font-semibold">{glInfo.length ? glInfo.map(({ang})=> ang.toFixed(1)+"°").join('  |  ') : '—'}</div></div>
+            </div>
+          </div>
+
+          <div className="mt-3 text-xs text-neutral-400">Notas: Modelo ignora acoplamento mútuo, perdas e estrutura de suporte. Padrão vertical; 90° = horizonte. Para tilt de estação base, valores típicos de θ₀: 95–105° (downtilt 5–15°).</div>
+        </div>
+
+        {/* Rodapé com CTA do modal */}
+        <div className="mt-3 flex items-center justify-end">
+          <button onClick={()=>setShowModal(true)} className="px-3 py-1.5 rounded-md bg-sky-600 hover:bg-sky-500 transition">Explicações matemáticas</button>
+        </div>
+      </div>
+
+      {/* MODAL DE EXPLICAÇÕES */}
+      {/* Mantém o modal fora do SVG para não sobrepor graficamente */}
+      <Modal show={showModal} onClose={()=>setShowModal(false)}>
+        <div className="space-y-3 text-sm text-neutral-200">
+          <p><b>Elemento</b>: dipolo fino de λ/2 (vertical). Fator de elemento (campo): |E(θ)| = |cos((π/2)·cosθ)/sinθ|. Nulos em 0°/180°.</p>
+          <p><b>Arranjo (geral)</b>: AF(θ) = sin(Nψ/2)/sin(ψ/2), com ψ = 2π(d/λ)cosθ + α. α é a diferença de fase entre elementos adjacentes (no sentido do empilhamento).</p>
+          <p><b>Apontamento</b>: para mirar o feixe em θ₀, escolha α = −2π(d/λ)cosθ₀ ⇒ ψ = 2π(d/λ)(cosθ − cosθ₀). Isso desloca o máximo para θ≈θ₀.</p>
+          <p><b>Grating lobes</b>: máximos do AF quando ψ = 2πm ⇒ cosθ = (m − α/2π)/(d/λ). Quando |cosθ|≤1 além do feixe principal, surgem lóbulos de grade.</p>
+          <p><b>Padrão total</b>: |E·AF| em campo; potência ∝ |E·AF|². Mostrado em polar (campo) e planar (dB).</p>
+          <p><b>Diretividade</b> (vertical): D = 2·Pmax / ∫ P(θ) sinθ dθ (integração numérica). Ganho mostrado em dBi; para dBd subtrai-se 2.15 dB.</p>
+          <p><b>Defasagem por elemento</b>: ϕₙ = n·α (n=0…N−1). A trilha colorida indica a fase relativa (cromática HSL ~ 0–360°).</p>
+          <p className="text-neutral-400">Limitações: não inclui acoplamento mútuo, impedâncias, perdas, cabos, nem superestruturas. Use como estudo de padrão ideal.</p>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ---------- Componente Modal reutilizável ----------
+function Modal({ show, onClose, children }: { show: boolean; onClose: () => void; children: React.ReactNode }) {
+  if (!show) return null;
+  return (
+    <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}
+        className="max-w-3xl w-full bg-neutral-900 border border-neutral-800 rounded-2xl p-6 text-neutral-100" onClick={(e)=>e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-xl font-semibold">Explicações & Matemática</h2>
+          <button onClick={onClose} className="px-3 py-1.5 rounded-md bg-neutral-800 hover:bg-neutral-700">Fechar</button>
+        </div>
+        {children}
+      </motion.div>
+    </div>
+  );
+}
